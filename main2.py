@@ -1,0 +1,384 @@
+from flask import Flask, request
+from linebot import LineBotApi, WebhookHandler
+from linebot.exceptions import InvalidSignatureError
+from linebot.models import (
+    MessageEvent, TextMessage, ImageMessage, TextSendMessage,
+    FlexSendMessage, QuickReply, QuickReplyButton, MessageAction, PostbackEvent
+)
+
+import re, tempfile
+import mysql.connector
+from ultralytics import YOLO
+from sep.recommend import get_random_recipe
+
+# ====== Flask App ======
+app = Flask(__name__)
+
+# ====== LINE Bot 設定 ======
+channel_access_token = 'bU54KhRXTsIdL62vsw+pK4P57ioelBvYKBvY5HOpU2tiRQsLmaziUBYFScF35u28SU9jBioaOYgfbLrPAUwItLUWYhSegwXYEWThzytFS6Hg0CZw1kw2ArpfiUKVYp6ROnXaybiMGJikO3f2y7f+9AdB04t89/1O/w1cDnyilFU='
+channel_secret = 'adbd0ef6979c9025caecaefa77574753'
+line_bot_api = LineBotApi(channel_access_token)
+handler = WebhookHandler(channel_secret)
+
+# ====== 載入 YOLO 模型 ======
+MODEL_PATH = r"C:\Users\user\Downloads\best.pt"
+model = YOLO(MODEL_PATH)
+
+# ====== 會員系統 API URL (你 Flask 的 ngrok 網址) ======
+# MEMBER_API_URL = "https://04509b7e8cc2.ngrok-free.app/register"
+
+# ====== 英文 → 中文 同義詞 ======
+EN2ZH_SYNONYM = {
+    "apple": ["蘋果"], "avocado": ["酪梨"], "banana": ["香蕉"],
+    "bell pepper": ["甜椒"], "bitter gourd": ["苦瓜"], "broccoli": ["花椰菜"],
+    "cabbage": ["高麗菜", "包心菜"], "carrot": ["紅蘿蔔", "胡蘿蔔"],
+    "cauliflower": ["白花椰菜", "菜花"], "chili": ["辣椒"], "corn": ["玉米"],
+    "cucumber": ["小黃瓜", "胡瓜"], "eggplant": ["茄子"], "garlic": ["大蒜", "蒜頭"],
+    "grape": ["葡萄"], "hot pepper": ["辣椒", "朝天椒"], "kiwi": ["奇異果", "獼猴桃"],
+    "lemon": ["檸檬"], "mango": ["芒果"], "melon": ["香瓜", "哈密瓜"],
+    "onion": ["洋蔥"], "orange": ["柳橙", "橙子"], "papaya": ["木瓜"],
+    "peach": ["桃子"], "pear": ["梨子"], "persimmon": ["柿子"],
+    "pineapple": ["鳳梨", "菠蘿"], "plum": ["李子"], "potato": ["馬鈴薯"],
+    "pumpkin": ["南瓜"], "radish": ["白蘿蔔", "蘿蔔"], "strawberry": ["草莓"],
+    "tomato": ["蕃茄", "番茄"], "watermelon": ["西瓜"], "zucchini": ["櫛瓜", "西葫蘆"]
+}
+
+def detected_items_to_keywords(items, min_conf=0.25):
+    """YOLO 偵測結果 → 中文關鍵字"""
+    keywords, seen = [], set()
+    for it in items:
+        name = (it.get("name") or "").lower()
+        conf = float(it.get("confidence", 0))
+        if conf < min_conf or not name:
+            continue
+        zh_list = EN2ZH_SYNONYM.get(name, [name])
+        main_kw = zh_list[0]
+        if main_kw not in seen:
+            seen.add(main_kw)
+            keywords.append(main_kw)
+    return " ".join(keywords)
+
+
+# ====== MySQL 工具 ======
+def get_conn_cursor(): 
+    conn = mysql.connector.connect( 
+        host="127.0.0.1", user="root", password="smartcook0518", database="recipe_db", charset="utf8mb4" )
+    return conn, conn.cursor(buffered=True)
+
+# ====== 查詢食譜 ======
+def query_recipes(keyword, servings):
+    keywords = keyword.split()
+    clauses, params = [], []
+
+    # ---- 1. 食材關鍵字匹配 ----
+    for kw in keywords:
+        synonyms = [kw]
+        for group in EN2ZH_SYNONYM.values():
+            if kw in group:
+                synonyms = group
+                break
+        or_clause = " OR ".join(["ingredients LIKE %s"] * len(synonyms))
+        clauses.append(f"({or_clause})")
+        params.extend([f"%{syn}%" for syn in synonyms])
+
+    where_clause = " AND ".join(clauses)
+
+    # # ---- 2. 加上飲食偏好（分類）條件 ----
+    # if diet_preference:
+    #     where_clause += " AND category LIKE %s"
+    #     params.append(f"%{diet_preference}%")
+
+    # # ---- 3. 避開過敏原 ----
+    # for a in allergens:
+    #     where_clause += " AND ingredients NOT LIKE %s"
+    #     params.append(f"%{a}%")
+
+    # ---- 4. SQL 組合 ----
+    sql = f"""
+    SELECT id, title, ingredients, servings
+    FROM recipes
+    WHERE {where_clause}
+      AND (servings LIKE %s OR servings = '未標示')
+    ORDER BY 
+      CASE WHEN servings LIKE %s THEN 1 ELSE 2 END,  -- 符合份數的排前面
+      RAND()
+    LIMIT 5
+    """
+    params.append(f"%{servings}%")
+    params.append(f"%{servings}%")
+
+    # ---- 5. 執行查詢 ----
+    conn, cur = get_conn_cursor()
+    cur.execute(sql, params)
+    rows = cur.fetchall()
+    cur.close(); conn.close()
+
+    # ---- 6. 回傳結果 ----
+    return [
+        {"id": r[0], "title": r[1], "ingredients": r[2], "servings": r[3]}
+        for r in rows
+    ]
+
+
+def get_recipe_detail(recipe_id):
+    conn, cur = get_conn_cursor()
+    cur.execute("SELECT title, ingredients, instructions, servings FROM recipes WHERE id=%s", (recipe_id,))
+    row = cur.fetchone()
+    cur.close(); conn.close()
+    if row:
+        return dict(title=row[0], ingredients=row[1], instructions=row[2], servings=row[3])
+    return None
+
+
+# ====== Flex bubble ======
+def build_recipe_bubbles(recipes):
+    bubbles = []
+    for r in recipes:
+        snippet = r["ingredients"][:30] + ("…" if len(r["ingredients"]) > 30 else "")
+        servings_display = r["servings"] if r["servings"] else "未標示"
+        bubbles.append({
+            "type": "bubble", "size": "micro",
+            "body": {
+                "type": "box", "layout": "vertical", "spacing": "sm", "paddingAll": "13px",
+                "contents": [
+                    {"type": "text", "text": r["title"], "weight": "bold", "size": "sm", "wrap": True},
+                    {"type": "text", "text": f"份量：{servings_display}", "size": "xs", "color": "#555555", "wrap": True},
+                    {"type": "text", "text": snippet, "size": "xs", "color": "#888888", "wrap": True}
+                ]
+            },
+            "footer": {
+                "type": "box", "layout": "vertical", "contents": [
+                    {"type": "button",
+                     "action": {"type": "postback", "label": "查看食譜",
+                                "data": f"action=view_recipe&id={r['id']}"},
+                     "style": "link", "height": "sm"}
+                ]
+            }
+        })
+    return bubbles
+
+
+# ====== 暫存使用者輸入 ======
+user_pending_keyword = {}
+
+
+# ====== LINE webhook ======
+@app.route("/callback", methods=['POST'])
+def callback():
+    body = request.get_data(as_text=True)
+    signature = request.headers.get('X-Line-Signature')
+    try:
+        handler.handle(body, signature)
+    except InvalidSignatureError:
+        print("❌ InvalidSignatureError: 檢查 Channel Secret 或 Webhook URL")
+        return 'OK'
+    except Exception as e:
+        print("❌ handler error:", e)
+        return 'OK'
+    return 'OK'
+
+
+# ====== 文字訊息 ======
+@handler.add(MessageEvent, message=TextMessage)
+def on_text(event):
+    print("🔹 使用者 ID:", event.source.user_id)
+    user_id = event.source.user_id
+    user_input = event.message.text.strip()
+
+    # ✅ 會員專區（一定要放最前面，避免被後面誤判）
+    if "會員專區" in user_input:
+        print("✅ 進入會員專區區塊")
+
+        bubble = {
+            "type": "bubble",
+            "body": {
+                "type": "box",
+                "layout": "vertical",
+                "contents": [
+                    {
+                        "type": "text",
+                        "text": "會員專區",
+                        "weight": "bold",
+                        "size": "xl",
+                        "align": "center",
+                        "color": "#000000"
+                    }
+                ],
+                "backgroundColor": "#F6C2B9",
+                "paddingAll": "10px"            
+            },
+            "footer": {
+                "type": "box",
+                "layout": "vertical",
+                "spacing": "sm",
+                "contents": [
+                    {
+                        "type": "button",
+                        "style": "link",
+                        "height": "sm",
+                        "color": "#000000",
+                        "action": {
+                            "type": "uri",
+                            "label": "綁定個人資料",
+                            "uri": "http://13.236.77.140:5000/register"
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "style": "link",
+                        "height": "sm",
+                        "color": "#000000",
+                        "action": {
+                            "type": "uri",
+                            "label": "刪除個人資料",
+                            "uri": "http://13.236.77.140:5000/register"
+                        }
+                    },
+                    {
+                        "type": "button",
+                        "style": "link",
+                        "height": "sm",
+                        "color": "#000000",
+                        "action": {
+                            "type": "uri",
+                            "label": "飲食習慣類型",
+                            "uri": "http://13.236.77.140:5000/register"
+                        }
+                    }
+                ]
+            },
+            "styles": {
+                "body": {"backgroundColor": "#FFEBEB"},
+                "footer": {"backgroundColor": "#FFEBEB"}
+            }
+        }
+
+        return line_bot_api.reply_message(
+            event.reply_token,
+            FlexSendMessage(alt_text="會員專區", contents=bubble)
+        )
+
+    # 🎲 Rich Menu「餐點推薦」 → 一次推薦三個 bubble
+    if user_input == "餐點推薦":
+        conn, cur = get_conn_cursor()
+        cur.execute("""
+            SELECT id, title, ingredients, servings
+            FROM recipes
+            ORDER BY RAND()
+            LIMIT 3
+        """)
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+
+        if not rows:
+            return line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text="目前沒有可推薦的食譜 😢")
+            )
+
+        recipes = [
+            {"id": r[0], "title": r[1], "ingredients": r[2], "servings": r[3]}
+            for r in rows
+        ]
+        bubbles = build_recipe_bubbles(recipes)
+        carousel = {"type": "carousel", "contents": bubbles}
+
+        flex_msg = FlexSendMessage(alt_text="今日隨機推薦", contents=carousel)
+        return line_bot_api.reply_message(event.reply_token, flex_msg)
+    
+    # 📌 若使用者正在輸入人數
+    if user_id in user_pending_keyword:
+        m = re.fullmatch(r"(\d+)\s*人", user_input)
+        if not m:
+            return line_bot_api.reply_message(
+                event.reply_token, 
+                TextSendMessage(text="請輸入幾人份，例如：2人、3人")
+            )
+
+        servings = m.group(1)
+        keyword = user_pending_keyword.pop(user_id)
+        recipes = query_recipes(keyword, servings)
+
+        # member_id = 1  # 暫時用測試帳號
+        # try:
+        #     res = requests.get(f"{MEMBER_API_URL}/{member_id}")
+        #     member_data = res.json()
+        #     diet_pref = (member_data.get("diet_preference") or "").strip().lower()
+        #     allergens = [a.strip().lower() for a in (member_data.get("allergens") or "").split(",") if a.strip()]
+        # except Exception as e:
+        #     print("⚠️ 無法取得會員資料：", e)
+        #     diet_pref, allergens = "", []
+
+        # recipes = query_recipes(keyword, servings, diet_pref, allergens)
+
+        if not recipes:
+            return line_bot_api.reply_message(
+                event.reply_token,
+                TextSendMessage(text=f"找不到包含「{keyword}」的食譜 😢")
+            )
+
+        bubbles = build_recipe_bubbles(recipes)
+        carousel = {"type": "carousel", "contents": bubbles}
+        flex_msg = FlexSendMessage(alt_text="推薦食譜", contents=carousel)
+        return line_bot_api.reply_message(event.reply_token, flex_msg)
+        
+
+    # 📌 第一次輸入：食材名稱
+    keyword = user_input
+    user_pending_keyword[user_id] = keyword
+    quick = QuickReply(items=[QuickReplyButton(action=MessageAction(label=f"{n}人", text=f"{n}人")) for n in range(1, 7)])
+    return line_bot_api.reply_message(
+            event.reply_token, TextSendMessage(text=f"「{keyword}」要做幾人份呢？", quick_reply=quick)
+        )
+
+# ====== 圖片訊息 (YOLO 辨識) ======
+@handler.add(MessageEvent, message=ImageMessage)
+def on_image(event):
+    user_id = event.source.user_id
+
+    # 下載圖片到暫存檔
+    content = line_bot_api.get_message_content(event.message.id)
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tmp:
+        for chunk in content.iter_content():
+            tmp.write(chunk)
+        image_path = tmp.name
+
+    # YOLO 推論
+    res = model.predict(image_path, conf=0.25, imgsz=640, verbose=False)[0]
+    items = [{"name": res.names[int(b.cls[0])], "confidence": float(b.conf[0])} for b in res.boxes]
+
+    # 轉換成中文關鍵字
+    keyword_str = detected_items_to_keywords(items, min_conf=0.25)
+    if not keyword_str:
+        return line_bot_api.reply_message(
+            event.reply_token,
+            TextSendMessage(text="我沒有在圖裡找到可用的食材😅\n可以再拍清楚一點或換角度試試。")
+        )
+
+    user_pending_keyword[user_id] = keyword_str
+    quick = QuickReply(items=[QuickReplyButton(action=MessageAction(label=f"{n}人", text=f"{n}人")) for n in range(1, 7)])
+    line_bot_api.reply_message(
+        event.reply_token,
+        TextSendMessage(text=f"辨識到：{keyword_str}\n要做幾人份呢？", quick_reply=quick)
+    )
+
+
+# ====== Postback 處理 ======
+@handler.add(PostbackEvent)
+def handle_postback(event):
+    data = event.postback.data
+    print("📩 收到 postback data:", data)   # <-- 新增這行
+
+    if data.startswith("action=view_recipe&id="):
+        recipe_id = int(data.split("=")[-1])
+        recipe = get_recipe_detail(recipe_id)
+        if not recipe:
+            return line_bot_api.reply_message(event.reply_token, TextSendMessage(text="找不到這道食譜了 😢"))
+
+        detail_msg = f"🍽 {recipe['title']}（{recipe['servings']}）\n\n🧂 食材：\n{recipe['ingredients']}\n\n👨‍🍳 步驟：\n{recipe['instructions']}"
+        return line_bot_api.reply_message(event.reply_token, TextSendMessage(text=detail_msg))
+
+
+# ====== 啟動伺服器 ======
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=True)
