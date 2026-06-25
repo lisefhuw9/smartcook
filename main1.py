@@ -15,8 +15,8 @@ from sep.recommend import get_random_recipe
 app = Flask(__name__)
 
 # ====== LINE Bot 設定 ======
-channel_access_token = 'bU54KhRXTsIdL62vsw+pK4P57ioelBvYKBvY5HOpU2tiRQsLmaziUBYFScF35u28SU9jBioaOYgfbLrPAUwItLUWYhSegwXYEWThzytFS6Hg0CZw1kw2ArpfiUKVYp6ROnXaybiMGJikO3f2y7f+9AdB04t89/1O/w1cDnyilFU='
-channel_secret = 'adbd0ef6979c9025caecaefa77574753'
+channel_access_token = '***********************'
+channel_secret = '**********************'
 line_bot_api = LineBotApi(channel_access_token)
 handler = WebhookHandler(channel_secret)
 
@@ -61,8 +61,8 @@ def get_conn_cursor():
     conn = mysql.connector.connect(
         host="recipes-db.crkieu4eg5xp.ap-southeast-2.rds.amazonaws.com",
         user="admin",
-        password="Lisa951024!",
-        database="recipes",   # ⚠️ 這是你 RDS 的資料庫名稱
+        password="**************",
+        database="recipes",   
         charset="utf8mb4"
     )
     return conn, conn.cursor(buffered=True)
@@ -71,7 +71,7 @@ def get_member_conn_cursor():
     conn = mysql.connector.connect(
         host="recipes-db.crkieu4eg5xp.ap-southeast-2.rds.amazonaws.com",
         user="admin",
-        password="Lisa951024!",
+        password="*****************",
         database="members",
         charset="utf8mb4"
     )
